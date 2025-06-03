@@ -8,102 +8,86 @@ This guide documents how to generate and send BLE commands to control a Bluetoot
 
 * **Protocol**: BLE (Bluetooth Low Energy)
 * **Write Type**: Write Request
-* **Characteristic Handle**: `0x0012`
+* **Service UUID**: `00000000-cc7a-482a-984a-7f2ed5b3e58f`
+* **Characteristic UUID**: `00000000-8e22-4541-9d4c-21edae82ed19`
+* **Handle**: `0x0012`
 * **Payload Size**: 33 bytes
-* **Checksum**: CRC-8/SMBus over the first 32 bytes
+* **Checksum**: CRC-8/SMBus over the first 32 bytes (using `anycrc` library)
 
 ---
 
 ## Payload Format (33 Bytes)
 
-| Byte Range | Purpose             | Description                                              |
-| ---------- | ------------------- | -------------------------------------------------------- |
-| 0–3        | Nonce / Counter     | 4-byte little-endian integer, must be unique per command |
-| 4–7        | Fixed Session Bytes | Constant: `68 40 3A 68`                                  |
-| 8–11       | Echo of Counter     | Exact copy of bytes 0–3                                  |
-| 12–13      | Device Signature    | Constant: `3A 68`                                        |
-| 14–15      | Reserved            | Always `00 00`                                           |
-| 16–19      | Timestamp Block     | **Mirrored 2-byte monotonic counter**, increments slowly |
-| 20–23      | Reserved            | Always `00 00 00 00`                                     |
-| 24         | Command Opcode      | `0x01 = Open`, `0x02 = Close`                            |
-| 25–31      | Padding             | Always `00 00 00 00 00 00 00`                            |
-| 32         | CRC-8/SMBus         | Calculated over bytes 0–31                               |
+| Byte Range | Purpose           | Description                                                                            |
+| ---------- | ----------------- | -------------------------------------------------------------------------------------- |
+| 0–3        | Nonce / Counter   | 4-byte little-endian number; unique per command                                        |
+| 4–7        | Device ID / Fixed | Fixed: `68 40 3A 68`                                                                   |
+| 8–11       | Echo of Counter   | Same as bytes 0–3 (for redundancy or validation)                                       |
+| 12–13      | Signature         | Constant: `3A 68`                                                                      |
+| 14–15      | Reserved          | Always `00 00`                                                                         |
+| 16–17      | Freshness Counter | 2-byte monotonic value: Byte 17 changes every minute; Byte 16 changes less predictably |
+| 18–19      | Mirror of 16–17   | Same as 16–17                                                                          |
+| 20–23      | Reserved          | Always `00 00 00 00`                                                                   |
+| 24         | Command           | `01 = open`, `02 = close`                                                              |
+| 25–31      | Padding           | Always `00 00 00 00 00 00 00`                                                          |
+| 32         | CRC-8/SMBus       | Calculated over bytes 0–31 using the `anycrc` Python library                           |
+
+**Note on Freshness Counter (Bytes 16–17):**
+
+* Byte 17 appears to increment once per minute (modulo 256)
+* Byte 16 changes less predictably and may represent a session ID or boot counter
+* Use mirrored 2-byte value across both 16–17 and 18–19
+* For best results, update Byte 17 every minute and reuse Byte 16 unless a pattern emerges
 
 ---
 
-## CRC-8/SMBus Details
-
-* **Polynomial**: `0x31` (x^8 + x^5 + x^4 + 1)
-* **Init**: `0x00`
-* **XOR Out**: `0x00`
-* **RefIn/RefOut**: True
-
-Use a standard CRC-8/SMBus implementation to generate the checksum byte.
-
----
-
-## Python Example Code
+## Python Example Code Using `anycrc`
 
 ```python
-import time
+import anycrc
 import struct
-import crcmod
 
-# Setup CRC-8/SMBus
-crc8 = crcmod.predefined.mkPredefinedCrcFun('crc-8-smbus')
-
-def get_mirrored_counter_block(counter_value: int) -> bytes:
-    b = counter_value.to_bytes(2, byteorder='big')
-    return b + b
-
-def build_ble_command(counter: int, session_counter: int, command: int) -> bytes:
+def build_ble_command(counter: int, freshness: int, command: int) -> bytes:
     c_bytes = struct.pack('<I', counter)
-    fixed = bytes.fromhex('68403a68')
+    fixed_id = bytes.fromhex('68403a68')
     echo = c_bytes
-    header = c_bytes + fixed + echo + bytes.fromhex('3a680000')
-    ts_block = get_mirrored_counter_block(session_counter)
-    reserved = b'\x00' * 4
-    cmd_block = bytes([command]) + b'\x00' * 7
-    payload = header + ts_block + reserved + cmd_block
-    crc = crc8(payload)
+    signature = bytes.fromhex('3a68')
+    reserved = b'\x00\x00'
+
+    freshness_bytes = freshness.to_bytes(2, 'big')
+    ts_block = freshness_bytes + freshness_bytes  # mirrored
+
+    reserved2 = b'\x00\x00\x00\x00'
+    cmd = bytes([command])
+    pad = b'\x00' * 7
+
+    payload = (
+        c_bytes + fixed_id + echo + signature + reserved +
+        ts_block + reserved2 + cmd + pad
+    )
+
+    crc8 = anycrc.Model('CRC8-SMBUS')
+    crc = crc8.calc(payload)
     return payload + bytes([crc])
 
 # Example usage
-payload = build_ble_command(0x009e403a, 0x1722, 0x01)  # Open command
-print("BLE Payload:", payload.hex())
+payload = build_ble_command(counter=0x008a403a, freshness=0x1722, command=0x01)
+print("Payload:", payload.hex())
 ```
-
----
-
-## Timestamp Field Clarification (Bytes 16–19)
-
-Analysis of BLE packet logs shows that bytes 16–19:
-
-* Are two identical 2-byte values (mirrored)
-* Increment slowly over time, not with every command
-* Do not directly correlate with epoch time or Unix timestamps
-
-**Interpretation:**
-This field appears to be a **monotonic session or freshness counter** used by the device to:
-
-* Prevent replay attacks
-* Validate command recency
-* Possibly synchronize with internal timing logic
-
-**Recommended Strategy:**
-
-* Treat it as a 16-bit integer that increments periodically (e.g., every 10–30 seconds)
-* Mirror the value across both halves
-* Increment it with every command or group of commands to avoid reuse
 
 ---
 
 ## Transmission Instructions
 
 1. Connect to the BLE device as a GATT client.
-2. Write the 33-byte payload to characteristic handle `0x0012` using a Write Request.
-3. Update the counter and timestamp for each new command.
-4. The BLE device will process the command if the structure and checksum are valid.
+2. Use the following identifiers:
+
+   * **Service UUID**: `00000000-cc7a-482a-984a-7f2ed5b3e58f`
+   * **Characteristic UUID**: `00000000-8e22-4541-9d4c-21edae82ed19`
+   * **Handle**: `0x0012` (if writing by handle instead of UUID)
+3. Write the 33-byte payload using a Write Request.
+4. Update the counter and freshness fields for every command.
+5. The BLE device will process the command if the structure and checksum are valid.
 
 ---
 

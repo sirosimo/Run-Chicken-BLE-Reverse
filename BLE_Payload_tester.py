@@ -1,8 +1,8 @@
 import struct
-import crcmod
+import anycrc
 
 # Use the SMBus predefined CRC
-crc8 = crcmod.predefined.mkCrcFun('crc-8-smbus')
+crc8 = anycrc.Model('CRC8-SMBUS')
 
 def build_ble_command(counter: int, session_counter: int, command: int) -> bytes:
     c_bytes = struct.pack('<I', counter)
@@ -19,7 +19,7 @@ def build_ble_command(counter: int, session_counter: int, command: int) -> bytes
         c_bytes + fixed + echo + signature + reserved1 +
         ts_block + reserved2 + cmd + padding
     )
-    crc = crc8(payload_32)
+    crc = crc8.calc(payload_32)
     payload = payload_32 + bytes([crc])
     return payload
 
